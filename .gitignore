@@ -16,3 +16,9 @@
 local.properties
 .env
 debug.keystore
+
+# audit hygiene: never commit secrets, block-page artifacts, or portfolio screenshots
+nse_cookies.txt
+page.html
+public/assets/aistudio/*.jpg
+public/assets/aistudio/*.jpeg
