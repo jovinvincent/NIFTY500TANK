@@ -430,7 +430,7 @@ private fun ExecutiveCompassCard(report: DeadlyComboReport) {
                         if (primaryPe != null) {
                             val ltPart = medPeLt?.let { "20Y Med ${it}×" } ?: "Long-Term Band"
                             val pctPart = when {
-                                medPePctile != null && consPctile != null -> " • ${medPePctile}th (20Y) / ${consPctile}th (Cons.)"
+                                medPePctile != null && consPctile != null -> " • ${medPePctile}th (20Y mixed) / ${consPctile}th (Cons.)"
                                 medPePctile != null -> " • ${medPePctile}th %ile"
                                 else -> ""
                             }
@@ -606,7 +606,7 @@ private fun MultiHolePositionRadarCard(report: DeadlyComboReport) {
                     val eqNote = if (eqWtMed != null) " • Eq-Wt Med ${eqWtMed}×" else ""
                     "Official NSE Index P/E (Zero-Bias Point-in-Time$eqNote)"
                 } else {
-                    "Absolute Median P/E (20Y Historical Band)"
+                    "Absolute Median P/E (20Y band; pre/post-2021 basis)"
                 }
                 HoleRowItem(
                     holeName = absRowTitle,

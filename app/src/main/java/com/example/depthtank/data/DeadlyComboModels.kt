@@ -925,6 +925,7 @@ object DeadlyComboEngine {
             if (moved > 0) roundTwo((adv.toDouble() / moved.toDouble()) * 100.0) else null
         } else null
 
+        var lastResolvedAd: Double? = null
         for (i in startScan..lastIdx) {
             val dt = activeHist[i].date
             val ov = macroOverlays[dt]
@@ -944,9 +945,12 @@ object DeadlyComboEngine {
             val resolvedAd = when {
                 i == lastIdx && liveStockAd != null -> liveStockAd
                 explicitAd != null -> explicitAd
-                else -> (50.0 + activeHist[i].dailyDelta * 8.0).coerceIn(10.0, 90.0)
+                else -> lastResolvedAd
             }
-            adWindow.add(resolvedAd)
+            if (resolvedAd != null) {
+                adWindow.add(resolvedAd)
+                lastResolvedAd = resolvedAd
+            }
             if (dt >= INDIA_VIX_INCEPTION_DATE && runVix != null && (runVixDate == null || calendarDaysBetween(runVixDate, dt) <= 30L)) {
                 vixWindow.add(runVix)
             }
@@ -1230,7 +1234,7 @@ object DeadlyComboEngine {
             } else "N/A"
         }
         val pctPart = when {
-            historicalPctile != null && consolidatedPctile != null -> ", ${historicalPctile}th %ile (20Y) / ${consolidatedPctile}th (Cons.)"
+            historicalPctile != null && consolidatedPctile != null -> ", ${historicalPctile}th %ile (20Y mixed) / ${consolidatedPctile}th (Cons.)"
             historicalPctile != null -> ", ${historicalPctile}th %ile"
             else -> ""
         }
@@ -1422,7 +1426,7 @@ object DeadlyComboEngine {
         val peSummaryTag = if (peLevel != null || primaryPe != null) {
             val absPart = if (primaryPe != null) {
                 val pctStr = when {
-                    medPePctile != null && consPctile != null -> ", ${medPePctile}th %ile 20Y / ${consPctile}th Cons."
+                    medPePctile != null && consPctile != null -> ", ${medPePctile}th %ile 20Y mixed / ${consPctile}th Cons."
                     medPePctile != null -> ", ${medPePctile}th %ile"
                     else -> ""
                 }
@@ -1700,7 +1704,7 @@ object DeadlyComboEngine {
         val peInline = if (peLevel != null || primaryPe != null) {
             val absPart = if (primaryPe != null) {
                 val pctStr = when {
-                    medPePctile != null && consPctile != null -> ", ${medPePctile}th %ile 20Y / ${consPctile}th Cons."
+                    medPePctile != null && consPctile != null -> ", ${medPePctile}th %ile 20Y mixed / ${consPctile}th Cons."
                     medPePctile != null -> ", ${medPePctile}th %ile"
                     else -> ""
                 }

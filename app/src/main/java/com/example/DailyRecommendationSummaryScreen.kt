@@ -459,9 +459,13 @@ fun DailyRecommendationSummaryScreen(
 
                                     Spacer(Modifier.height(3.dp))
 
-                                    val avgAlpha = summaryItems.map { it.backtestAlphaPct }.filter { it > 0.0 }.average().let { if (it.isNaN()) 2.4 else it }
+                                    val avgAlpha = summaryItems.map { it.backtestAlphaPct }.filter { it > 0.0 }.average().takeUnless { it.isNaN() }
                                     Text(
-                                        text = "Evolves with newest closing NAV. Backtested alpha: +${String.format(Locale.US, "%.1f", avgAlpha)}% vs blind SIPs. Tap for Audit!",
+                                        text = if (avgAlpha != null) {
+                                            "Evolves with newest closing NAV. Backtested alpha: +${String.format(Locale.US, "%.1f", avgAlpha)}% vs blind SIPs. Tap for Audit!"
+                                        } else {
+                                            "Evolves with newest closing NAV. No positive-alpha backtest sessions yet. Tap for Audit!"
+                                        },
                                         style = MaterialTheme.typography.bodySmall.copy(
                                             fontSize = 11.sp,
                                             fontWeight = FontWeight.Medium

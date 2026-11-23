@@ -523,7 +523,7 @@ internal fun TrajectoryPathForecastCard(report: DeadlyComboReport) {
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     KineticTile(
-                        label = "A/D Ratio",
+                        label = "A/D Ratio (partial)",
                         value = "${k.adPctDaily}%",
                         sub = "3D Avg ${k.adPct3dAvg}%",
                         valueColor = when {
