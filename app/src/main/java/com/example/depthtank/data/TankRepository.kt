@@ -205,11 +205,11 @@ class TankRepository(
                     _macroOverlays.value = mergedMacros
 
                     val liveIntegrity = DatasetIntegrityMetadata(
-                        dataQuality = DataQuality.VERIFIED_EOD,
+                        dataQuality = baseHistoryIntegrity.dataQuality,
                         constituentCoverage = roundFourDecimals(
                             eligibleCached.size.toDouble() / DatasetIntegrityMetadata.INDEX_TARGET_CONSTITUENTS
                         ).coerceIn(0.0, 1.0),
-                        isIllustrative = false,
+                        isIllustrative = baseHistoryIntegrity.isIllustrative,
                         lastVerifiedTradingDate = cached.tradeDate,
                         excludedInsufficientHistoryCount = (cached.stocks.size - eligibleCached.size).coerceAtLeast(0)
                     )
@@ -235,11 +235,11 @@ class TankRepository(
                     val vaultHistoryN500 = restoredAllHistories[TankIndexUniverse.NIFTY_500] ?: baseHistory
                     val latestVaultDate = vaultHistoryN500.lastOrNull()?.date ?: seedLatestDate
                     val vaultIntegrity = DatasetIntegrityMetadata(
-                        dataQuality = DataQuality.VERIFIED_EOD,
+                        dataQuality = baseHistoryIntegrity.dataQuality,
                         constituentCoverage = roundFourDecimals(
                             baseStocks.size.toDouble() / DatasetIntegrityMetadata.INDEX_TARGET_CONSTITUENTS
                         ).coerceIn(0.0, 1.0),
-                        isIllustrative = false,
+                        isIllustrative = baseHistoryIntegrity.isIllustrative,
                         lastVerifiedTradingDate = latestVaultDate,
                         excludedInsufficientHistoryCount = excludedSeedCount
                     )
@@ -692,11 +692,11 @@ class TankRepository(
                     payload.integrity.excludedInsufficientHistoryCount
 
                 val liveIntegrity = DatasetIntegrityMetadata(
-                    dataQuality = if (eligibleLiveStocks.size >= 450) DataQuality.VERIFIED_EOD else DataQuality.ILLUSTRATIVE_FALLBACK,
+                    dataQuality = if (eligibleLiveStocks.size >= 450 && !payload.integrity.isIllustrative) DataQuality.VERIFIED_EOD else DataQuality.ILLUSTRATIVE_FALLBACK,
                     constituentCoverage = roundFourDecimals(
                         eligibleLiveStocks.size.toDouble() / DatasetIntegrityMetadata.INDEX_TARGET_CONSTITUENTS
                     ).coerceIn(0.0, 1.0),
-                    isIllustrative = eligibleLiveStocks.size < 450,
+                    isIllustrative = eligibleLiveStocks.size < 450 || payload.integrity.isIllustrative,
                     lastVerifiedTradingDate = tradeDate,
                     excludedInsufficientHistoryCount = excludedCount
                 )

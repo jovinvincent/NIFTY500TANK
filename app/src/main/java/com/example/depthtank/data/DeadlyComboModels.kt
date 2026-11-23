@@ -148,7 +148,7 @@ enum class InvestorActionStage(
         stepIndex = 6,
         shortTitle = "Execute Massive Profit Booking (35%–50%)",
         badgeLabel = "DEFENSIVE ROTATION",
-        phaseConditionSummary = "Confirmed Secular Peak Sniper ≥ 8/9 (H75 ≥ 58.5% + A/D & VIX crack)"
+        phaseConditionSummary = "Confirmed Secular Peak Sniper ≥ 7/9 (H75 ≥ 58.5% + A/D & VIX crack)"
     )
 }
 
