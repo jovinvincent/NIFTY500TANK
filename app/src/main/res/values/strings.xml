@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Nifty 500 Water Tank</string>
+    <string name="action_refresh_live_report">Refresh live VIX, MMI and breadth data</string>
+</resources>

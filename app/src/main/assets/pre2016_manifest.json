@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "startDate": "1995-01-02",
+  "endDate": "2016-03-31",
+  "firstActive200dDate": "1995-08-25",
+  "reconstructedPeriodEnd": "1998-07-31",
+  "vixInceptionDate": "2008-03-03",
+  "mmiInceptionDate": "2016-04-01",
+  "counts": {
+    "nifty500": 5261,
+    "nifty50": 5261,
+    "next50": 5261,
+    "midcap150": 5261,
+    "smallcap250": 5261,
+    "macroDates": 5101,
+    "vixDates": 1978
+  },
+  "files": {
+    "tankHistory": {
+      "asset": "pre2016_tank_history.json.gz",
+      "rawBytes": 1937468,
+      "gzBytes": 276921,
+      "rawSha256": "5fce25f10eb4e1ff019a2649b8b43ed66cf0f2b6eef9af5d4df6e391a8d6774a",
+      "gzSha256": "a343a1a0a0334e5eb7390e676d00bdbb685bf00c4a8f36a4efde8b65f047e61f"
+    },
+    "subIndexHistory": {
+      "asset": "pre2016_subindex_history.json.gz",
+      "rawBytes": 7421466,
+      "gzBytes": 783086,
+      "rawSha256": "bfc6b984f77409ab0f4d72b90c5103bea294e36d3e178125628251fbaeff916a",
+      "gzSha256": "4e58a81f088f84f5241e13cdee62b19790659ee9277cf25430dd20d907fdac5e"
+    },
+    "macroOverlays": {
+      "asset": "pre2016_macro_overlays.json.gz",
+      "rawBytes": 674497,
+      "gzBytes": 92475,
+      "rawSha256": "f726cd394e2cd2c2eb5e3f10f442969cd30051a043792fcc5451696eb0002e20",
+      "gzSha256": "d85d448232d9190032a50d3e98e13a110e7136114b95577967bf7575c7082946"
+    }
+  }
+}

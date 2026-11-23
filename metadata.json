@@ -1,0 +1,8 @@
+{
+  "name": "Nifty 500 Water Tank",
+  "description": "Equal-weight hydro-dynamic Nifty 500 market breadth analyzer from April 2016 to present.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
