@@ -92,6 +92,7 @@ fun DashboardScreen(
     onSelectTimeframe: (TimeframeOption) -> Unit,
     onSelectAggregation: (ChartAggregation) -> Unit = {},
     onRetryArchive: () -> Unit = {},
+    onForceRefresh: () -> Unit = {},
     onOpenInfoModal: () -> Unit,
     onHoleThresholdChange: (Float) -> Unit = {},
     onResetHoleThreshold: () -> Unit = {},
@@ -116,6 +117,7 @@ fun DashboardScreen(
             DashboardHeader(
                 uiState = uiState,
                 onSelectUniverse = onSelectUniverse,
+                onForceRefresh = onForceRefresh,
                 onOpenInfoModal = onOpenInfoModal
             )
         }
@@ -333,6 +335,7 @@ private fun DailyDualValuationRecommendationCard(
 private fun DashboardHeader(
     uiState: TankUiState,
     onSelectUniverse: (TankIndexUniverse) -> Unit,
+    onForceRefresh: () -> Unit,
     onOpenInfoModal: () -> Unit
 ) {
     val integrity = uiState.datasetIntegrity
@@ -449,14 +452,33 @@ private fun DashboardHeader(
         ) {
             // Live market auto-refresh / EOD verified trading date sync badge
             val isLiveMarket = uiState.pipelineStatus.isLiveMarketActive
+            val isDelayedOrOffline = uiState.pipelineStatus.lastSyncedDisplay.startsWith("Delayed", ignoreCase = true) ||
+                uiState.pipelineStatus.lastSyncedDisplay.startsWith("Cached", ignoreCase = true) ||
+                uiState.pipelineStatus.errorMessage != null
+            val syncBadgeTint = when {
+                uiState.pipelineStatus.isSyncing -> CyanLiquid
+                isDelayedOrOffline -> BreakoutAmber
+                isLiveMarket -> EmeraldBullish
+                else -> CyanLiquid
+            }
+            val syncBadgeContainer = when {
+                isDelayedOrOffline -> BreakoutAmber.copy(alpha = 0.12f)
+                isLiveMarket -> EmeraldBullish.copy(alpha = 0.12f)
+                else -> ElevatedCardSurface
+            }
+            val syncBadgeBorder = when {
+                isDelayedOrOffline -> BreakoutAmber.copy(alpha = 0.45f)
+                isLiveMarket -> EmeraldBullish.copy(alpha = 0.45f)
+                else -> HairlineBorder
+            }
             Surface(
                 shape = RoundedCornerShape(50),
-                color = if (isLiveMarket) EmeraldBullish.copy(alpha = 0.12f) else ElevatedCardSurface,
-                border = BorderStroke(
-                    1.dp,
-                    if (isLiveMarket) EmeraldBullish.copy(alpha = 0.45f) else HairlineBorder
-                ),
-                modifier = Modifier.testTag("dashboard_sync_badge")
+                color = syncBadgeContainer,
+                border = BorderStroke(1.dp, syncBadgeBorder),
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .clickable(enabled = !uiState.pipelineStatus.isSyncing) { onForceRefresh() }
+                    .testTag("dashboard_sync_badge")
             ) {
                 Row(
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
@@ -465,13 +487,15 @@ private fun DashboardHeader(
                 ) {
                     Icon(
                         imageVector = Icons.Rounded.Sync,
-                        contentDescription = null,
-                        tint = if (isLiveMarket) EmeraldBullish else CyanLiquid,
+                        contentDescription = "Tap to refresh live market feed",
+                        tint = syncBadgeTint,
                         modifier = Modifier.size(13.dp)
                     )
                     Text(
                         text = when {
-                            uiState.pipelineStatus.isSyncing -> "Syncing NSE/BSE Feed..."
+                            uiState.pipelineStatus.isSyncing -> "Syncing NSE/Yahoo Live Feed..."
+                            isLiveMarket && uiState.pipelineStatus.errorMessage != null ->
+                                "${uiState.pipelineStatus.lastSyncedDisplay} • Offline (Tap retry)"
                             isLiveMarket && uiState.pipelineStatus.isLiveHydrated ->
                                 "${uiState.pipelineStatus.lastSyncedDisplay} • Auto 30s"
                             isLiveMarket ->
@@ -480,7 +504,11 @@ private fun DashboardHeader(
                                 "EOD $verifiedDateFormatted • Mon–Fri @ 4:15 PM IST"
                         },
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (isLiveMarket) EmeraldBullish else TextSecondary
+                        color = when {
+                            isDelayedOrOffline -> BreakoutAmber
+                            isLiveMarket -> EmeraldBullish
+                            else -> TextSecondary
+                        }
                     )
                 }
             }

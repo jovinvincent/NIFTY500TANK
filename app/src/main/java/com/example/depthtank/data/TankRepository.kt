@@ -87,6 +87,7 @@ class TankRepository(
     )
 
     private val loadMutex = Mutex()
+    private val refreshMutex = Mutex()
     private val pre2016Mutex = Mutex()
     private var initialized = false
     private var pre2016Loaded = false
@@ -221,12 +222,23 @@ class TankRepository(
                         historyIntegrity = baseHistoryIntegrity,
                         sessionDate = cached.tradeDate
                     )
+                    val nowInitIst = ZonedDateTime.now(NseMarketCalendar.IST_ZONE)
+                    val expectedInitSession = NseMarketCalendar.latestMarketSessionDate(nowInitIst).toString()
+                    val isOpenInit = NseMarketCalendar.isMarketOpen(nowInitIst)
+                    val restoredDisplay = if (cached.tradeDate < expectedInitSession &&
+                        cached.syncedDisplay.startsWith("LIVE:", ignoreCase = true)
+                    ) {
+                        "Cached EOD: ${NseMarketCalendar.formatDdMmmYyyy(cached.tradeDate)}"
+                    } else {
+                        cached.syncedDisplay
+                    }
                     _pipelineStatus.value = _pipelineStatus.value.copy(
-                        lastSyncedDisplay = cached.syncedDisplay,
+                        lastSyncedDisplay = restoredDisplay,
                         lastTradeDate = cached.tradeDate,
                         sourceDisplay = cached.sourceName,
                         trackedStocksCount = eligibleCached.size,
                         isLiveHydrated = true,
+                        isLiveMarketActive = isOpenInit,
                         integrity = liveIntegrity,
                         historyIntegrity = baseHistoryIntegrity
                     )
@@ -251,11 +263,13 @@ class TankRepository(
                         historyIntegrity = baseHistoryIntegrity,
                         sessionDate = latestVaultDate
                     )
+                    val isOpenInit = NseMarketCalendar.isMarketOpen(ZonedDateTime.now(NseMarketCalendar.IST_ZONE))
                     _pipelineStatus.value = _pipelineStatus.value.copy(
                         lastSyncedDisplay = "Auto-Synced: EOD Vault (${NseMarketCalendar.formatDdMmmYyyy(latestVaultDate)})",
                         lastTradeDate = latestVaultDate,
                         trackedStocksCount = baseStocks.size,
                         isLiveHydrated = false,
+                        isLiveMarketActive = isOpenInit,
                         integrity = vaultIntegrity,
                         historyIntegrity = baseHistoryIntegrity
                     )
@@ -534,41 +548,56 @@ class TankRepository(
 
     suspend fun refreshLiveMarketData(silent: Boolean = false): Result<Unit> = withContext(Dispatchers.IO) {
         ensureInitialized()
-        val nowCheckIst = ZonedDateTime.now(NseMarketCalendar.IST_ZONE)
-        _pipelineStatus.value = _pipelineStatus.value.copy(
-            isSyncing = if (silent) _pipelineStatus.value.isSyncing else true,
-            isLiveMarketActive = NseMarketCalendar.isMarketOpen(nowCheckIst),
-            errorMessage = null
-        )
-
-        val priorStocksMap = _stocks.value.associateBy { it.symbol }
-        val priorTradeDate = _pipelineStatus.value.lastTradeDate
-
-        val (remoteResult, macroResult) = coroutineScope {
-            val stocksDeferred = async { remoteDataSource.fetchLiveNifty500Stocks() }
-            val macroDeferred = async { remoteDataSource.fetchLiveMacroSnapshot() }
-            stocksDeferred.await() to macroDeferred.await()
+        if (!silent) {
+            val nowPreIst = ZonedDateTime.now(NseMarketCalendar.IST_ZONE)
+            _pipelineStatus.value = _pipelineStatus.value.copy(
+                isSyncing = true,
+                isLiveMarketActive = NseMarketCalendar.isMarketOpen(nowPreIst),
+                errorMessage = null
+            )
         }
 
-        val fetchedMacro = macroResult.getOrNull()
+        refreshMutex.withLock {
+            val nowCheckIst = ZonedDateTime.now(NseMarketCalendar.IST_ZONE)
+            _pipelineStatus.value = _pipelineStatus.value.copy(
+                isSyncing = if (silent) _pipelineStatus.value.isSyncing else true,
+                isLiveMarketActive = NseMarketCalendar.isMarketOpen(nowCheckIst),
+                errorMessage = null
+            )
 
-        return@withContext remoteResult.fold(
-            onSuccess = { payload ->
-                val nowIst = ZonedDateTime.now(NseMarketCalendar.IST_ZONE)
-                val expectedLatestSession = NseMarketCalendar.latestMarketSessionDate(nowIst).toString()
-                val tradeDate = payload.sessionDate
-                    ?.takeIf { NseMarketCalendar.isValidTradingIsoDate(it) && it <= expectedLatestSession }
-                    ?: expectedLatestSession
-                val formattedDate = NseMarketCalendar.formatDdMmmYyyy(tradeDate)
-                val isMarketOpenNow = NseMarketCalendar.isMarketOpen(nowIst)
-                val isMarketOffToday = !NseMarketCalendar.isTradingDay(nowIst.toLocalDate()) ||
-                    nowIst.toLocalTime().isBefore(LocalTime.of(9, 15))
-                val syncedDisplay = when {
-                    isMarketOpenNow -> "LIVE: $formattedDate • ${nowIst.format(TIME_FORMATTER)} IST"
-                    isMarketOffToday && tradeDate != nowIst.toLocalDate().toString() ->
-                        "Synced: $formattedDate (Market Off)"
-                    else -> "Auto-Synced: $formattedDate • ${nowIst.format(TIME_FORMATTER)} IST"
-                }
+            val priorStocksMap = _stocks.value.associateBy { it.symbol }
+            val priorTradeDate = _pipelineStatus.value.lastTradeDate
+
+            val (remoteResult, macroResult) = coroutineScope {
+                val stocksDeferred = async { remoteDataSource.fetchLiveNifty500Stocks() }
+                val macroDeferred = async { remoteDataSource.fetchLiveMacroSnapshot() }
+                stocksDeferred.await() to macroDeferred.await()
+            }
+
+            val fetchedMacro = macroResult.getOrNull()
+
+            return@withLock remoteResult.fold(
+                onSuccess = { payload ->
+                    val nowIst = ZonedDateTime.now(NseMarketCalendar.IST_ZONE)
+                    val expectedLatestSession = NseMarketCalendar.latestMarketSessionDate(nowIst).toString()
+                    val tradeDate = payload.sessionDate
+                        ?.takeIf { NseMarketCalendar.isValidTradingIsoDate(it) && it <= expectedLatestSession }
+                        ?: expectedLatestSession
+                    val formattedDate = NseMarketCalendar.formatDdMmmYyyy(tradeDate)
+                    val isMarketOpenNow = NseMarketCalendar.isMarketOpen(nowIst)
+                    val isCurrentSessionSynced = (tradeDate == expectedLatestSession)
+                    val isMarketOffToday = !NseMarketCalendar.isTradingDay(nowIst.toLocalDate()) ||
+                        nowIst.toLocalTime().isBefore(LocalTime.of(9, 15))
+                    val syncedDisplay = when {
+                        isMarketOpenNow && isCurrentSessionSynced ->
+                            "LIVE: $formattedDate • ${nowIst.format(TIME_FORMATTER)} IST"
+                        isMarketOpenNow && !isCurrentSessionSynced ->
+                            "Delayed ($formattedDate EOD) • ${nowIst.format(TIME_FORMATTER)} IST"
+                        isMarketOffToday && tradeDate != nowIst.toLocalDate().toString() ->
+                            "Synced: $formattedDate (Market Off)"
+                        else ->
+                            "Auto-Synced: $formattedDate • ${nowIst.format(TIME_FORMATTER)} IST"
+                    }
 
                 // Backfill prior52WHigh from prior session snapshot (prefer TV [1] bar if available, else cached snapshot)
                 val tvPriorDayMap = payload.historicalStocksByDate.entries
@@ -733,27 +762,30 @@ class TankRepository(
                 )
                 Result.success(Unit)
             },
-            onFailure = { error ->
-                if (fetchedMacro != null) {
-                    val updatedMacroOverlays = applyMacroSnapshot(_macroOverlays.value, fetchedMacro)
-                    _macroOverlays.value = updatedMacroOverlays
-                    saveLiveMacroVault(updatedMacroOverlays)
+                onFailure = { error ->
+                    if (fetchedMacro != null) {
+                        val updatedMacroOverlays = applyMacroSnapshot(_macroOverlays.value, fetchedMacro)
+                        _macroOverlays.value = updatedMacroOverlays
+                        saveLiveMacroVault(updatedMacroOverlays)
+                    }
+                    val nowFailIst = ZonedDateTime.now(NseMarketCalendar.IST_ZONE)
+                    val latestDate = _history.value.lastOrNull()?.date ?: "2026-11-13"
+                    val currentCount = _stocks.value.size
+                    _pipelineStatus.value = _pipelineStatus.value.copy(
+                        isSyncing = false,
+                        isLiveMarketActive = NseMarketCalendar.isMarketOpen(nowFailIst),
+                        lastSyncedDisplay = if (_pipelineStatus.value.isLiveHydrated) {
+                            _pipelineStatus.value.lastSyncedDisplay
+                        } else {
+                            "Auto-Synced: EOD Vault (${NseMarketCalendar.formatDdMmmYyyy(latestDate)})"
+                        },
+                        trackedStocksCount = currentCount,
+                        errorMessage = "Offline / market feed unreachable — displaying verified EOD vault."
+                    )
+                    Result.failure(error)
                 }
-                val latestDate = _history.value.lastOrNull()?.date ?: "2026-11-13"
-                val currentCount = _stocks.value.size
-                _pipelineStatus.value = _pipelineStatus.value.copy(
-                    isSyncing = false,
-                    lastSyncedDisplay = if (_pipelineStatus.value.isLiveHydrated) {
-                        _pipelineStatus.value.lastSyncedDisplay
-                    } else {
-                        "Auto-Synced: EOD Vault (${NseMarketCalendar.formatDdMmmYyyy(latestDate)})"
-                    },
-                    trackedStocksCount = currentCount,
-                    errorMessage = "Offline / market feed unreachable — displaying verified EOD vault."
-                )
-                Result.failure(error)
-            }
-        )
+            )
+        }
     }
 
     private fun publishState(
@@ -1659,7 +1691,7 @@ class TankRepository(
                 put("calculationVersion", DatasetIntegrityMetadata.CALCULATION_VERSION)
                 put("stocks", arr)
             }
-            File(context.filesDir, LIVE_CACHE_FILE).writeText(root.toString())
+            writeTextAtomically(File(context.filesDir, LIVE_CACHE_FILE), root.toString())
         } catch (e: Exception) {
             Log.w(TAG, "Failed saving live cache", e)
         }
@@ -1727,7 +1759,7 @@ class TankRepository(
                 }
                 root.put(u.subIndexHistoryKey, arr)
             }
-            File(context.filesDir, LIVE_HISTORY_VAULT_FILE).writeText(root.toString())
+            writeTextAtomically(File(context.filesDir, LIVE_HISTORY_VAULT_FILE), root.toString())
         } catch (e: Exception) {
             Log.w(TAG, "Failed saving live history vault", e)
         }
@@ -1785,9 +1817,26 @@ class TankRepository(
                     }
                 )
             }
-            File(context.filesDir, LIVE_MACRO_VAULT_FILE).writeText(root.toString())
+            writeTextAtomically(File(context.filesDir, LIVE_MACRO_VAULT_FILE), root.toString())
         } catch (e: Exception) {
             Log.w(TAG, "Failed saving live macro vault", e)
+        }
+    }
+
+    private fun writeTextAtomically(targetFile: File, content: String) {
+        val parent = targetFile.parentFile
+        if (parent != null && !parent.exists()) parent.mkdirs()
+        val tmp = File(parent, "${targetFile.name}.tmp")
+        try {
+            tmp.writeText(content)
+            if (targetFile.exists()) targetFile.delete()
+            if (!tmp.renameTo(targetFile)) {
+                targetFile.writeText(content)
+                tmp.delete()
+            }
+        } catch (e: Exception) {
+            runCatching { tmp.delete() }
+            throw e
         }
     }
 }

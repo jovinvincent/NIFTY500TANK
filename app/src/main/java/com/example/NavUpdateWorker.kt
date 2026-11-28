@@ -185,12 +185,16 @@ class NavUpdateWorker(
                 }
                 val todayStr = todayDf.format(Date())
                 
-                // Always perform daily backup for today before concluding work
+                // Perform daily auto backup only once per day
                 try {
-                    val jsonString = generateBackupJsonStringDirect(appContext, repository)
-                    if (jsonString != null) {
-                        saveBackupAndRotateDirect(appContext, jsonString)
-                        Log.d("NavUpdateWorker", "Daily auto backup completed successfully.")
+                    val syncPrefs = appContext.getSharedPreferences("sync_prefs", Context.MODE_PRIVATE)
+                    val lastBackupDate = syncPrefs.getString("last_backup_date", "") ?: ""
+                    if (lastBackupDate != todayStr) {
+                        val jsonString = generateBackupJsonStringDirect(appContext, repository)
+                        if (jsonString != null) {
+                            saveBackupAndRotateDirect(appContext, jsonString)
+                            Log.d("NavUpdateWorker", "Daily auto backup completed successfully.")
+                        }
                     }
                 } catch (e: Exception) {
                     Log.e("NavUpdateWorker", "Daily auto backup failed", e)
@@ -230,15 +234,7 @@ class NavUpdateWorker(
 
             } catch (e: Exception) {
                 Log.e("NavUpdateWorker", "Error in sync", e)
-                try {
-                    val repo = FundRepository(AppDatabase.getDatabase(appContext).fundDao())
-                    val jsonString = generateBackupJsonStringDirect(appContext, repo)
-                    if (jsonString != null) {
-                        saveBackupAndRotateDirect(appContext, jsonString)
-                    }
-                } catch (be: Exception) {
-                    Log.e("NavUpdateWorker", "Fallback auto backup failed", be)
-                }
+
                 if (isPastTimeLimit()) {
                     scheduleNext(appContext)
                 } else {

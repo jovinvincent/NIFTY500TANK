@@ -264,6 +264,7 @@ fun DepthTankRootContent(
                                 onSelectTimeframe = onSelectTimeframe,
                                 onSelectAggregation = onSelectAggregation,
                                 onRetryArchive = onRetryArchive,
+                                onForceRefresh = onForceRefresh,
                                 onOpenInfoModal = onOpenInfoModal,
                                 onHoleThresholdChange = onHoleThresholdChange,
                                 onResetHoleThreshold = onResetHoleThreshold,

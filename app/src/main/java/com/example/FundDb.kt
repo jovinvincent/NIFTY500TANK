@@ -152,7 +152,15 @@ abstract class AppDatabase : RoomDatabase() {
                     "qsif_nav_database"
                 )
                 .fallbackToDestructiveMigration()
-                .allowMainThreadQueries()
+                .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
+                .addCallback(object : RoomDatabase.Callback() {
+                    override fun onOpen(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                        super.onOpen(db)
+                        try {
+                            db.query("PRAGMA wal_checkpoint(TRUNCATE);").close()
+                        } catch (_: Exception) {}
+                    }
+                })
                 .build()
                 INSTANCE = instance
                 instance

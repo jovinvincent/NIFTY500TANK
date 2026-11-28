@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.time.ZonedDateTime
+import java.util.concurrent.atomic.AtomicBoolean
 
 data class TankUiState(
     val isLoading: Boolean = true,
@@ -73,6 +74,8 @@ class TankViewModel(application: Application) : AndroidViewModel(application) {
 
     private var isForegroundActive: Boolean = true
     private var lastLiveRefreshMs: Long = 0L
+    private var lastAttemptMs: Long = 0L
+    private val refreshInFlight = AtomicBoolean(false)
     private var marketHoursPollJob: Job? = null
 
     private data class FilterState(
@@ -402,10 +405,20 @@ class TankViewModel(application: Application) : AndroidViewModel(application) {
                 delay(400L)
                 repository.ensurePre2016Loaded()
             }
-            repository.refreshLiveMarketData(silent = false).onSuccess {
+            executeRefresh(silent = false)
+            startMarketHoursPolling()
+        }
+    }
+
+    private suspend fun executeRefresh(silent: Boolean) {
+        if (!refreshInFlight.compareAndSet(false, true)) return
+        lastAttemptMs = System.currentTimeMillis()
+        try {
+            repository.refreshLiveMarketData(silent = silent).onSuccess {
                 lastLiveRefreshMs = System.currentTimeMillis()
             }
-            startMarketHoursPolling()
+        } finally {
+            refreshInFlight.set(false)
         }
     }
 
@@ -413,12 +426,13 @@ class TankViewModel(application: Application) : AndroidViewModel(application) {
         isForegroundActive = active
         if (active) {
             startMarketHoursPolling()
+            if (refreshInFlight.get()) return
             val nowMs = System.currentTimeMillis()
             val nowIst = ZonedDateTime.now(NseMarketCalendar.IST_ZONE)
             val expectedSession = NseMarketCalendar.latestMarketSessionDate(nowIst).toString()
             val currentSession = repository.pipelineStatus.value.lastTradeDate
             val hasLiveMacro = repository.macroOverlays.value[expectedSession]?.adPctByUniverse?.isNotEmpty() == true
-            val isStale = (nowMs - lastLiveRefreshMs) >= LIVE_POLL_INTERVAL_MS
+            val isStale = (nowMs - lastAttemptMs) >= LIVE_POLL_INTERVAL_MS
             val needsSync = NseMarketCalendar.isMarketOpen(nowIst) ||
                 NseMarketCalendar.isPostCloseSettlementWindow(nowIst) ||
                 currentSession < expectedSession ||
@@ -426,9 +440,7 @@ class TankViewModel(application: Application) : AndroidViewModel(application) {
                 !hasLiveMacro
             if (needsSync && isStale) {
                 viewModelScope.launch {
-                    repository.refreshLiveMarketData(silent = true).onSuccess {
-                        lastLiveRefreshMs = System.currentTimeMillis()
-                    }
+                    executeRefresh(silent = true)
                 }
             }
         } else {
@@ -442,17 +454,18 @@ class TankViewModel(application: Application) : AndroidViewModel(application) {
         marketHoursPollJob = viewModelScope.launch {
             while (isActive) {
                 delay(LIVE_POLL_INTERVAL_MS)
-                if (!isForegroundActive) continue
+                if (!isForegroundActive || refreshInFlight.get()) continue
+                val nowMs = System.currentTimeMillis()
                 val nowIst = ZonedDateTime.now(NseMarketCalendar.IST_ZONE)
                 val expectedSession = NseMarketCalendar.latestMarketSessionDate(nowIst).toString()
+                val isOpen = NseMarketCalendar.isMarketOpen(nowIst)
                 val needsEodSync = NseMarketCalendar.isPostCloseSettlementWindow(nowIst) &&
-                    (System.currentTimeMillis() - lastLiveRefreshMs) >= EOD_SETTLEMENT_POLL_MS
-                val behindSession = repository.pipelineStatus.value.lastTradeDate < expectedSession
-                val missingMacro = repository.macroOverlays.value[expectedSession]?.adPctByUniverse?.isNotEmpty() != true
-                if (NseMarketCalendar.isMarketOpen(nowIst) || needsEodSync || behindSession || missingMacro) {
-                    repository.refreshLiveMarketData(silent = true).onSuccess {
-                        lastLiveRefreshMs = System.currentTimeMillis()
-                    }
+                    (nowMs - lastAttemptMs) >= EOD_SETTLEMENT_POLL_MS
+                val behindOrMissing = (repository.pipelineStatus.value.lastTradeDate < expectedSession ||
+                    repository.macroOverlays.value[expectedSession]?.adPctByUniverse?.isNotEmpty() != true) &&
+                    (nowMs - lastAttemptMs) >= EOD_SETTLEMENT_POLL_MS
+                if (isOpen || needsEodSync || behindOrMissing) {
+                    executeRefresh(silent = true)
                 }
             }
         }
@@ -529,6 +542,7 @@ class TankViewModel(application: Application) : AndroidViewModel(application) {
 
     fun forceRefresh() {
         viewModelScope.launch {
+            lastAttemptMs = System.currentTimeMillis()
             repository.refreshLiveMarketData(silent = false).onSuccess {
                 lastLiveRefreshMs = System.currentTimeMillis()
             }

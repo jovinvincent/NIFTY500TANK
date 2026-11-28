@@ -12,6 +12,9 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
+import okhttp3.Cookie
+import okhttp3.CookieJar
+import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -22,7 +25,10 @@ import java.net.URLEncoder
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.max
@@ -86,8 +92,21 @@ class LiveMarketTankDataSource(
         private const val TICKERTAPE_MMI_NOW_URL = "https://api.tickertape.in/mmi/now"
         private const val TICKERTAPE_MMI_PAGE_URL = "https://www.tickertape.in/market-mood-index"
         private const val YAHOO_VIX_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/%5EINDIAVIX?range=1mo&interval=1d"
-        private const val YAHOO_SPARK_BASE_URL = "https://query1.finance.yahoo.com/v8/finance/spark"
+        private const val YAHOO_SPARK_PRIMARY_URL = "https://query1.finance.yahoo.com/v8/finance/spark"
+        private const val YAHOO_SPARK_SECONDARY_URL = "https://query2.finance.yahoo.com/v8/finance/spark"
+        private const val NSE_HOME_URL = "https://www.nseindia.com/market-data/live-equity-market"
         private const val NSE_ALL_INDICES_URL = "https://www.nseindia.com/api/allIndices"
+        private const val NSE_NIFTY500_QUOTES_URL = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20500"
+        private const val NSE_USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        private val KNOWN_BSE_REITS = setOf("BAGMANE", "BIRET", "EMBASSY")
+        private val NSE_TIMESTAMP_FORMATS = listOf(
+            DateTimeFormatter.ofPattern("dd-MMM-yyyy HH:mm:ss", Locale.US),
+            DateTimeFormatter.ofPattern("dd-MMM-yyyy", Locale.US),
+            DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss", Locale.US),
+            DateTimeFormatter.ofPattern("dd-MM-yyyy", Locale.US),
+            DateTimeFormatter.ISO_LOCAL_DATE
+        )
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private val IST_ZONE: ZoneId = ZoneId.of("Asia/Kolkata")
     }
@@ -100,11 +119,71 @@ class LiveMarketTankDataSource(
             .build()
     }
 
+    private val nseCookieStore = ConcurrentHashMap<String, MutableList<Cookie>>()
+    @Volatile
+    private var lastNseWarmupMs: Long = 0L
+
+    private val nseClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .cookieJar(object : CookieJar {
+                override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+                    val list = nseCookieStore.getOrPut(url.host) { mutableListOf() }
+                    synchronized(list) {
+                        val now = System.currentTimeMillis()
+                        list.removeAll { existing ->
+                            existing.expiresAt < now || cookies.any { it.name == existing.name && it.path == existing.path }
+                        }
+                        list.addAll(cookies)
+                    }
+                }
+
+                override fun loadForRequest(url: HttpUrl): List<Cookie> {
+                    val now = System.currentTimeMillis()
+                    val matched = ArrayList<Cookie>()
+                    for (cookies in nseCookieStore.values) {
+                        synchronized(cookies) {
+                            cookies.removeAll { it.expiresAt < now }
+                            for (c in cookies) {
+                                if (c.matches(url)) matched.add(c)
+                            }
+                        }
+                    }
+                    return matched
+                }
+            })
+            .connectTimeout(7, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .build()
+    }
+
     private data class ScannerQueryOutcome(
         val stocks: List<StockTank>,
         val sessionDate: String?,
         val historicalStocksByDate: Map<String, List<StockTank>> = emptyMap()
     )
+
+    internal data class LiveQuoteOverlay(
+        val lastPrice: Double,
+        val dailyChangePct: Double,
+        val barDate: String,
+        val dayHigh: Double? = null,
+        val yearHigh: Double? = null,
+        val yearLow: Double? = null
+    )
+
+    internal data class LiveOverlayOutcome(
+        val sourceLabel: String,
+        val sessionDate: String,
+        val quotesBySymbol: Map<String, LiveQuoteOverlay>
+    )
+
+    internal data class YahooSparkSeries(
+        val bars: List<Pair<String, Double>>,
+        val previousClose: Double?
+    )
+
+    private fun toTradingViewTickerSymbol(symbol: String): String =
+        symbol.replace("-", "_").replace("&", "_")
 
     override suspend fun fetchLiveNifty500Stocks(): Result<RemoteStocksResult> = withContext(Dispatchers.IO) {
         try {
@@ -113,25 +192,48 @@ class LiveMarketTankDataSource(
                 return@withContext Result.failure(IllegalStateException("Nifty 500 constituent list unavailable."))
             }
             val symbolSet = nifty500Universe.toHashSet()
-            val nseTickers = nifty500Universe.map { "NSE:${it.replace("-", "_")}" }
-            val nseOutcome = executeScannerQuery(nseTickers, symbolSet)
+            val nowIst = ZonedDateTime.now(IST_ZONE)
+            val expectedLatestSession = NseMarketCalendar.latestMarketSessionDate(nowIst).toString()
+            val isRealtimeWindow = NseMarketCalendar.isMarketOpen(nowIst) ||
+                NseMarketCalendar.isPostCloseSettlementWindow(nowIst)
+
+            val (tvOutcome, nseLiveOverlay) = coroutineScope {
+                val tvDeferred = async {
+                    runCatching {
+                        val nseTickers = nifty500Universe.map { "NSE:${toTradingViewTickerSymbol(it)}" }
+                        executeScannerQuery(nseTickers, symbolSet)
+                    }.getOrNull()
+                }
+                val nseLiveDeferred = async {
+                    if (isRealtimeWindow) {
+                        runCatching { fetchNseLiveEquityOverlay(symbolSet, expectedLatestSession) }.getOrNull()
+                    } else {
+                        null
+                    }
+                }
+                tvDeferred.await() to nseLiveDeferred.await()
+            }
 
             val combined = LinkedHashMap<String, StockTank>(512)
-            for (stock in nseOutcome.stocks) {
-                combined[stock.symbol] = stock
+            if (tvOutcome != null) {
+                for (stock in tvOutcome.stocks) {
+                    combined[stock.symbol] = stock
+                }
             }
             val historicalMerged = LinkedHashMap<String, LinkedHashMap<String, StockTank>>()
-            for ((dt, list) in nseOutcome.historicalStocksByDate) {
-                val map = historicalMerged.getOrPut(dt) { LinkedHashMap(512) }
-                for (st in list) map[st.symbol] = st
+            if (tvOutcome != null) {
+                for ((dt, list) in tvOutcome.historicalStocksByDate) {
+                    val map = historicalMerged.getOrPut(dt) { LinkedHashMap(512) }
+                    for (st in list) map[st.symbol] = st
+                }
             }
 
             // Fallback to BSE exchange for Nifty 500 REITs / constituents not indexed under NSE: (e.g. BAGMANE, BIRET, EMBASSY)
-            val missingSymbols = nifty500Universe.filter { it !in combined }
-            val bseSymbolsFound = LinkedHashSet<String>()
-            var resolvedSessionDate = nseOutcome.sessionDate
-            if (missingSymbols.isNotEmpty()) {
-                val bseTickers = missingSymbols.map { "BSE:${it.replace("-", "_")}" }
+            val missingAfterNseTv = nifty500Universe.filter { it !in combined }
+            val bseSymbolsFound = LinkedHashSet<String>(KNOWN_BSE_REITS)
+            var tvSessionDate = tvOutcome?.sessionDate
+            if (tvOutcome != null && missingAfterNseTv.isNotEmpty() && missingAfterNseTv.size < 120) {
+                val bseTickers = missingAfterNseTv.map { "BSE:${toTradingViewTickerSymbol(it)}" }
                 val bseOutcome = runCatching { executeScannerQuery(bseTickers, symbolSet) }.getOrNull()
                 if (bseOutcome != null) {
                     for (stock in bseOutcome.stocks) {
@@ -146,10 +248,113 @@ class LiveMarketTankDataSource(
                             if (st.symbol !in map) map[st.symbol] = st
                         }
                     }
-                    if (resolvedSessionDate == null) {
-                        resolvedSessionDate = bseOutcome.sessionDate
+                    if (tvSessionDate == null) {
+                        tvSessionDate = bseOutcome.sessionDate
                     }
                 }
+            }
+
+            val tvEligibleCount = TankCalculator.filterEligibleConstituents(combined.values.toList()).size
+            val tvIsBehindExpected = tvSessionDate == null || tvSessionDate < expectedLatestSession
+            val needsZeroDelayOverlay = isRealtimeWindow || tvIsBehindExpected || tvEligibleCount < 450
+
+            var activeOverlay: LiveOverlayOutcome? = nseLiveOverlay
+                ?.takeIf { it.quotesBySymbol.size >= 450 && (tvSessionDate == null || it.sessionDate >= tvSessionDate) }
+
+            if (needsZeroDelayOverlay && activeOverlay == null) {
+                // If after-hours and TradingView lagged or failed, also try NSE before falling back to Yahoo Spark
+                if (!isRealtimeWindow) {
+                    activeOverlay = runCatching { fetchNseLiveEquityOverlay(symbolSet, expectedLatestSession) }
+                        .getOrNull()
+                        ?.takeIf { it.quotesBySymbol.size >= 450 && (tvSessionDate == null || it.sessionDate >= tvSessionDate) }
+                }
+                if (activeOverlay == null) {
+                    activeOverlay = runCatching {
+                        fetchYahooLiveOverlay(
+                            symbols = nifty500Universe,
+                            bseSymbols = bseSymbolsFound,
+                            expectedLatestSession = expectedLatestSession
+                        )
+                    }.getOrNull()?.takeIf {
+                        it.quotesBySymbol.size >= 450 && (tvSessionDate == null || it.sessionDate >= tvSessionDate)
+                    }
+                }
+            }
+
+            // If TradingView failed or returned incomplete constituents, hydrate base metadata/ranges from local reference
+            if (tvEligibleCount < 450) {
+                val refStocks = loadReferenceStocksFallback()
+                for (ref in refStocks) {
+                    if (ref.symbol in symbolSet && ref.symbol !in combined) {
+                        combined[ref.symbol] = ref
+                    }
+                }
+            }
+
+            var resolvedSessionDate = tvSessionDate
+            var sourceDisplayPrefix = "NSE/BSE Live Constituent Feed"
+
+            if (activeOverlay != null && (tvSessionDate == null || activeOverlay.sessionDate >= tvSessionDate)) {
+                val overlaySession = activeOverlay.sessionDate
+                // Preserve TradingView's prior trading session snapshot into history before upgrading to today's live session
+                if (tvSessionDate != null &&
+                    tvSessionDate < overlaySession &&
+                    NseMarketCalendar.isValidTradingIsoDate(tvSessionDate) &&
+                    tvEligibleCount >= 450 &&
+                    tvSessionDate !in historicalMerged
+                ) {
+                    val tvDayMap = LinkedHashMap<String, StockTank>(combined.size)
+                    for ((sym, st) in combined) tvDayMap[sym] = st
+                    historicalMerged[tvSessionDate] = tvDayMap
+                }
+
+                for ((sym, quote) in activeOverlay.quotesBySymbol) {
+                    val base = combined[sym] ?: continue
+                    // Only apply quotes that are at least as fresh as TradingView's bar
+                    if (tvSessionDate != null && quote.barDate < tvSessionDate && overlaySession == tvSessionDate) {
+                        continue
+                    }
+                    val newPrice = quote.lastPrice
+                    val isNewSessionFromBase = tvSessionDate != null && overlaySession > tvSessionDate
+                    val tradedInTargetSession = quote.barDate == overlaySession
+                    val newChg = if (tradedInTargetSession) quote.dailyChangePct else 0.0
+                    val newTodayHigh = when {
+                        tradedInTargetSession && quote.dayHigh != null && quote.dayHigh > 0.0 -> max(quote.dayHigh, newPrice)
+                        isNewSessionFromBase -> newPrice
+                        else -> max(base.todayHigh, newPrice)
+                    }
+                    val newLow52 = if (quote.yearLow != null && quote.yearHigh != null && quote.yearLow > 0.0 && quote.yearHigh > quote.yearLow) {
+                        min(quote.yearLow, newPrice)
+                    } else {
+                        min(base.low52W, newPrice)
+                    }
+                    val newHigh52 = if (quote.yearLow != null && quote.yearHigh != null && quote.yearLow > 0.0 && quote.yearHigh > quote.yearLow) {
+                        max(quote.yearHigh, newTodayHigh)
+                    } else {
+                        max(base.high52W, newTodayHigh)
+                    }
+                    val newPrior52 = if (isNewSessionFromBase) base.high52W else base.prior52WHigh
+                    val updatedPe = base.epsTtm
+                        ?.takeIf { it.isFinite() && it > 0.0001 }
+                        ?.let { eps -> (newPrice / eps).takeIf { it.isFinite() && it > 0.0 && it < 5000.0 } }
+                        ?: base.peTtm
+                    val updatedPeLow = if (updatedPe != null && base.peLow52W != null) min(base.peLow52W, updatedPe) else base.peLow52W
+                    val updatedPeHigh = if (updatedPe != null && base.peHigh52W != null) max(base.peHigh52W, updatedPe) else base.peHigh52W
+
+                    combined[sym] = base.copy(
+                        currentPrice = newPrice,
+                        low52W = newLow52,
+                        high52W = newHigh52,
+                        dailyChangePct = newChg,
+                        todayHigh = newTodayHigh,
+                        prior52WHigh = newPrior52,
+                        peTtm = updatedPe,
+                        peLow52W = updatedPeLow,
+                        peHigh52W = updatedPeHigh
+                    )
+                }
+                resolvedSessionDate = overlaySession
+                sourceDisplayPrefix = activeOverlay.sourceLabel
             }
 
             val parsed = combined.values.toList()
@@ -165,9 +370,7 @@ class LiveMarketTankDataSource(
                 dataQuality = DataQuality.VERIFIED_EOD,
                 constituentCoverage = coverage.coerceIn(0.0, 1.0),
                 isIllustrative = false,
-                lastVerifiedTradingDate = resolvedSessionDate ?: NseMarketCalendar.latestMarketSessionDate(
-                    java.time.ZonedDateTime.now(NseMarketCalendar.IST_ZONE)
-                ).toString(),
+                lastVerifiedTradingDate = resolvedSessionDate ?: expectedLatestSession,
                 excludedInsufficientHistoryCount = excludedCount
             )
             val eligibleHistorical = historicalMerged.mapValues { (_, map) ->
@@ -177,7 +380,7 @@ class LiveMarketTankDataSource(
             Result.success(
                 RemoteStocksResult(
                     stocks = eligible.sortedByDescending { it.score },
-                    sourceName = "NSE/BSE Live Constituent Feed (${eligible.size}/500)",
+                    sourceName = "$sourceDisplayPrefix (${eligible.size}/500)",
                     sessionDate = resolvedSessionDate,
                     integrity = integrity,
                     historicalStocksByDate = eligibleHistorical,
@@ -252,12 +455,12 @@ class LiveMarketTankDataSource(
         val chunks = symbols.chunked(20)
         val semaphore = Semaphore(6)
 
-        val perSymbolSeries = LinkedHashMap<String, List<Pair<String, Double>>>(symbols.size)
+        val perSymbolSeries = LinkedHashMap<String, YahooSparkSeries>(symbols.size)
         val chunkResults = coroutineScope {
             chunks.map { chunk ->
                 async {
                     semaphore.withPermit {
-                        runCatching { fetchYahooSparkBatch(chunk, bseSymbols) }.getOrDefault(emptyMap())
+                        runCatching { fetchYahooSparkSeriesBatch(chunk, bseSymbols, range = "1mo") }.getOrDefault(emptyMap())
                     }
                 }
             }.awaitAll()
@@ -267,16 +470,24 @@ class LiveMarketTankDataSource(
         }
         if (perSymbolSeries.isEmpty()) return@withContext emptyMap()
 
-        val result = LinkedHashMap<String, List<StockTank>>(missingDates.size)
+        val result = LinkedHashMap<String, List<Pair<String, Double>>>(symbols.size)
+        for ((sym, sData) in perSymbolSeries) {
+            result[sym] = sData.bars
+        }
+
+        val dayOut = LinkedHashMap<String, List<StockTank>>(missingDates.size)
         for (targetDate in missingDates.sorted()) {
             val dayStocks = ArrayList<StockTank>(refBySymbol.size)
             for ((sym, ref) in refBySymbol) {
-                val series = perSymbolSeries[sym] ?: continue
+                val series = result[sym] ?: continue
                 val idx = series.indexOfLast { it.first == targetDate }
                 if (idx < 0) continue
                 val closeVal = series[idx].second
                 if (closeVal <= 0.0 || closeVal.isNaN()) continue
-                val prevClose = if (idx > 0) series[idx - 1].second else closeVal
+                val prevClose = when {
+                    idx > 0 -> series[idx - 1].second
+                    else -> perSymbolSeries[sym]?.previousClose ?: closeVal
+                }
                 val chgPct = if (prevClose > 0.0) {
                     round(((closeVal - prevClose) / prevClose) * 10000.0) / 100.0
                 } else {
@@ -305,16 +516,88 @@ class LiveMarketTankDataSource(
                 )
             }
             if (dayStocks.size >= 450) {
-                result[targetDate] = dayStocks.sortedByDescending { it.score }
+                dayOut[targetDate] = dayStocks.sortedByDescending { it.score }
             }
         }
-        result
+        dayOut
     }
 
-    private fun fetchYahooSparkBatch(
+    private suspend fun fetchYahooLiveOverlay(
         symbols: List<String>,
-        bseSymbols: Set<String>
-    ): Map<String, List<Pair<String, Double>>> {
+        bseSymbols: Set<String>,
+        expectedLatestSession: String
+    ): LiveOverlayOutcome? = coroutineScope {
+        if (symbols.isEmpty()) return@coroutineScope null
+        val chunks = symbols.chunked(25)
+        val semaphore = Semaphore(8)
+        val perSymbolSeries = LinkedHashMap<String, YahooSparkSeries>(symbols.size)
+        val chunkResults = chunks.map { chunk ->
+            async {
+                semaphore.withPermit {
+                    runCatching { fetchYahooSparkSeriesBatch(chunk, bseSymbols, range = "5d") }.getOrDefault(emptyMap())
+                }
+            }
+        }.awaitAll()
+        for (batch in chunkResults) {
+            perSymbolSeries.putAll(batch)
+        }
+        if (perSymbolSeries.size < 400) return@coroutineScope null
+
+        val dateCounts = HashMap<String, Int>(8)
+        val validSeries = LinkedHashMap<String, YahooSparkSeries>(perSymbolSeries.size)
+        for ((sym, sData) in perSymbolSeries) {
+            val filteredBars = sData.bars.filter { (dt, _) ->
+                dt <= expectedLatestSession && NseMarketCalendar.isValidTradingIsoDate(dt)
+            }
+            if (filteredBars.isEmpty()) continue
+            val lastDt = filteredBars.last().first
+            dateCounts[lastDt] = (dateCounts[lastDt] ?: 0) + 1
+            validSeries[sym] = sData.copy(bars = filteredBars)
+        }
+        if (dateCounts.isEmpty()) return@coroutineScope null
+
+        val expectedCount = dateCounts[expectedLatestSession] ?: 0
+        val resolvedSession = if (expectedCount >= 200) {
+            expectedLatestSession
+        } else {
+            dateCounts.maxByOrNull { it.value }?.key ?: return@coroutineScope null
+        }
+
+        val quotes = LinkedHashMap<String, LiveQuoteOverlay>(validSeries.size)
+        for ((sym, sData) in validSeries) {
+            val bars = sData.bars
+            val lastBar = bars.last()
+            val closeVal = lastBar.second
+            if (closeVal <= 0.0 || !closeVal.isFinite()) continue
+            val prevClose = if (lastBar.first == resolvedSession) {
+                if (bars.size >= 2) bars[bars.size - 2].second else (sData.previousClose ?: closeVal)
+            } else {
+                closeVal
+            }
+            val chgPct = if (lastBar.first == resolvedSession && prevClose > 0.0) {
+                round(((closeVal - prevClose) / prevClose) * 10000.0) / 100.0
+            } else {
+                0.0
+            }
+            quotes[sym] = LiveQuoteOverlay(
+                lastPrice = closeVal,
+                dailyChangePct = chgPct,
+                barDate = lastBar.first
+            )
+        }
+        if (quotes.size < 450) null
+        else LiveOverlayOutcome(
+            sourceLabel = "Yahoo/TV Real-Time Live",
+            sessionDate = resolvedSession,
+            quotesBySymbol = quotes
+        )
+    }
+
+    private fun fetchYahooSparkSeriesBatch(
+        symbols: List<String>,
+        bseSymbols: Set<String>,
+        range: String
+    ): Map<String, YahooSparkSeries> {
         val yahooToAppSym = LinkedHashMap<String, String>(symbols.size)
         val encodedTickers = symbols.map { sym ->
             val suffix = if (sym in bseSymbols) ".BO" else ".NS"
@@ -322,41 +605,63 @@ class LiveMarketTankDataSource(
             yahooToAppSym[yf] = sym
             URLEncoder.encode(yf, "UTF-8")
         }
-        val url = "$YAHOO_SPARK_BASE_URL?symbols=${encodedTickers.joinToString(",")}&range=1mo&interval=1d"
-        val req = Request.Builder()
-            .url(url)
-            .get()
-            .header("User-Agent", "Mozilla/5.0 (Linux; Android 15)")
-            .build()
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return emptyMap()
-            val body = resp.body?.string().orEmpty()
-            if (body.isBlank()) return emptyMap()
-            val root = JSONObject(body)
-            val out = LinkedHashMap<String, List<Pair<String, Double>>>(symbols.size)
-            val keys = root.keys()
-            while (keys.hasNext()) {
-                val yfKey = keys.next()
-                val appSym = yahooToAppSym[yfKey] ?: yfKey.removeSuffix(".NS").removeSuffix(".BO")
-                val node = root.optJSONObject(yfKey) ?: continue
-                val tsArr = node.optJSONArray("timestamp") ?: continue
-                val closeArr = node.optJSONArray("close") ?: continue
-                val len = min(tsArr.length(), closeArr.length())
-                val series = ArrayList<Pair<String, Double>>(len)
-                for (i in 0 until len) {
-                    val ts = tsArr.optLong(i, 0L)
-                    val c = closeArr.optDouble(i, Double.NaN)
-                    if (ts > 1_600_000_000L && !c.isNaN() && c > 0.0) {
-                        val dt = Instant.ofEpochSecond(ts).atZone(IST_ZONE).toLocalDate().toString()
-                        series.add(dt to c)
-                    }
+        val query = "symbols=${encodedTickers.joinToString(",")}&range=$range&interval=1d"
+        for (baseUrl in listOf(YAHOO_SPARK_PRIMARY_URL, YAHOO_SPARK_SECONDARY_URL)) {
+            val req = Request.Builder()
+                .url("$baseUrl?$query")
+                .get()
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 15)")
+                .header("Accept", "application/json")
+                .header("Cache-Control", "no-cache")
+                .build()
+            val parsed = runCatching {
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use emptyMap()
+                    val body = resp.body?.string().orEmpty()
+                    if (body.isBlank()) return@use emptyMap()
+                    parseYahooSparkResponse(body, yahooToAppSym)
                 }
-                if (series.isNotEmpty()) {
-                    out[appSym] = series
+            }.getOrDefault(emptyMap())
+            if (parsed.isNotEmpty()) return parsed
+        }
+        return emptyMap()
+    }
+
+    internal fun parseYahooSparkResponse(
+        body: String,
+        yahooToAppSym: Map<String, String> = emptyMap()
+    ): Map<String, YahooSparkSeries> {
+        val root = JSONObject(body)
+        val out = LinkedHashMap<String, YahooSparkSeries>()
+        val keys = root.keys()
+        while (keys.hasNext()) {
+            val yfKey = keys.next()
+            val appSym = yahooToAppSym[yfKey]
+                ?: yfKey.removeSuffix(".NS").removeSuffix(".BO").uppercase(Locale.US)
+            val node = root.optJSONObject(yfKey) ?: continue
+            val tsArr = node.optJSONArray("timestamp") ?: continue
+            val closeArr = node.optJSONArray("close") ?: continue
+            val len = min(tsArr.length(), closeArr.length())
+            val dedupByDate = LinkedHashMap<String, Double>(len)
+            for (i in 0 until len) {
+                val ts = tsArr.optLong(i, 0L)
+                val c = closeArr.optDouble(i, Double.NaN)
+                if (ts > 1_600_000_000L && c.isFinite() && c > 0.0) {
+                    val dt = Instant.ofEpochSecond(ts).atZone(IST_ZONE).toLocalDate().toString()
+                    dedupByDate[dt] = c
                 }
             }
-            return out
+            val prevClose = sequenceOf("previousClose", "chartPreviousClose")
+                .map { key -> node.optDouble(key, Double.NaN) }
+                .firstOrNull { it.isFinite() && it > 0.0 }
+            if (dedupByDate.isNotEmpty()) {
+                out[appSym] = YahooSparkSeries(
+                    bars = dedupByDate.entries.map { it.key to it.value }.sortedBy { it.first },
+                    previousClose = prevClose
+                )
+            }
         }
+        return out
     }
 
     private fun fetchTradingViewVix(): Map<String, Double> {
@@ -408,6 +713,7 @@ class LiveMarketTankDataSource(
             .url(YAHOO_VIX_CHART_URL)
             .get()
             .header("User-Agent", "Mozilla/5.0 (Linux; Android 15)")
+            .header("Cache-Control", "no-cache")
             .build()
         client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) return emptyMap()
@@ -427,6 +733,13 @@ class LiveMarketTankDataSource(
                     val dt = Instant.ofEpochSecond(ts).atZone(IST_ZONE).toLocalDate().toString()
                     out[dt] = round(v * 100.0) / 100.0
                 }
+            }
+            val meta = res.optJSONObject("meta")
+            val regTime = meta?.optLong("regularMarketTime", 0L) ?: 0L
+            val regPrice = meta?.optDouble("regularMarketPrice", Double.NaN) ?: Double.NaN
+            if (regTime > 1_600_000_000L && regPrice.isFinite() && regPrice > 0.0) {
+                val dt = Instant.ofEpochSecond(regTime).atZone(IST_ZONE).toLocalDate().toString()
+                out[dt] = round(regPrice * 100.0) / 100.0
             }
             return out
         }
@@ -515,48 +828,163 @@ class LiveMarketTankDataSource(
         }
     }
 
-    private fun fetchNseIndicesMacro(): Pair<Pair<String, Double>?, Pair<String, Map<TankIndexUniverse, Double>>?>? {
-        val req = Request.Builder()
-            .url(NSE_ALL_INDICES_URL)
+    private fun ensureNseCookies(force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        if (!force && nseCookieStore.isNotEmpty() && (now - lastNseWarmupMs) < 300_000L) return
+        val warmupReq = Request.Builder()
+            .url(NSE_HOME_URL)
             .get()
-            .header("User-Agent", "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36")
-            .header("Accept", "application/json")
+            .header("User-Agent", NSE_USER_AGENT)
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header("Accept-Language", "en-US,en;q=0.9")
             .build()
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return null
-            val root = JSONObject(resp.body?.string().orEmpty())
-            val dataArr = root.optJSONArray("data") ?: return null
-            val sessionDt = NseMarketCalendar.latestMarketSessionDate(
-                java.time.ZonedDateTime.now(IST_ZONE)
-            ).toString()
-            var vixPair: Pair<String, Double>? = null
-            val adMap = LinkedHashMap<TankIndexUniverse, Double>()
-            val indexToUniverse = mapOf(
-                "NIFTY 500" to TankIndexUniverse.NIFTY_500,
-                "NIFTY 50" to TankIndexUniverse.NIFTY_50,
-                "NIFTY NEXT 50" to TankIndexUniverse.NEXT_50,
-                "NIFTY MIDCAP 150" to TankIndexUniverse.MIDCAP_150,
-                "NIFTY SMALLCAP 250" to TankIndexUniverse.SMALLCAP_250
+        runCatching {
+            nseClient.newCall(warmupReq).execute().use { it.body?.close() }
+            lastNseWarmupMs = System.currentTimeMillis()
+        }
+    }
+
+    private fun executeNseJsonGet(url: String): String? {
+        ensureNseCookies(force = false)
+        for (attempt in 0..1) {
+            val req = Request.Builder()
+                .url(url)
+                .get()
+                .header("User-Agent", NSE_USER_AGENT)
+                .header("Accept", "application/json, text/plain, */*")
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .header("Referer", NSE_HOME_URL)
+                .header("Cache-Control", "no-cache")
+                .build()
+            val (code, body) = runCatching {
+                nseClient.newCall(req).execute().use { resp ->
+                    resp.code to (if (resp.isSuccessful) resp.body?.string() else null)
+                }
+            }.getOrDefault(0 to null)
+            if (code == 200 && !body.isNullOrBlank()) return body
+            if (attempt == 0 && (code == 401 || code == 403 || code == 0)) {
+                ensureNseCookies(force = true)
+            } else {
+                break
+            }
+        }
+        return null
+    }
+
+    private fun fetchNseLiveEquityOverlay(
+        allowedSymbols: Set<String>,
+        expectedLatestSession: String
+    ): LiveOverlayOutcome? {
+        val jsonText = executeNseJsonGet(NSE_NIFTY500_QUOTES_URL) ?: return null
+        val parsed = parseNseEquityStockIndicesPayload(jsonText, allowedSymbols) ?: return null
+        if (parsed.sessionDate > expectedLatestSession) return null
+        return parsed
+    }
+
+    internal fun parseNseEquityStockIndicesPayload(
+        jsonText: String,
+        allowedSymbols: Set<String>
+    ): LiveOverlayOutcome? {
+        val root = JSONObject(jsonText)
+        val metadata = root.optJSONObject("metadata")
+        val rawTs = metadata?.optString("timeVal", "")
+            ?.ifBlank { root.optString("timestamp", "") }
+            ?: root.optString("timestamp", "")
+        val sessionDate = parseNseDateTimeToIsoDate(rawTs)
+            ?.takeIf { NseMarketCalendar.isValidTradingIsoDate(it) }
+            ?: return null
+        val dataArr = root.optJSONArray("data") ?: return null
+        val quotes = LinkedHashMap<String, LiveQuoteOverlay>(512)
+        for (i in 0 until dataArr.length()) {
+            val row = dataArr.optJSONObject(i) ?: continue
+            val sym = row.optString("symbol", "").trim().uppercase(Locale.US)
+            if (sym.isEmpty() || sym == "NIFTY 500" || row.optInt("priority", 0) == 1) continue
+            if (sym !in allowedSymbols) continue
+            val lastPrice = row.optDouble("lastPrice", Double.NaN).let {
+                if (it.isFinite() && it > 0.0) it else row.optDouble("close", Double.NaN)
+            }
+            if (!lastPrice.isFinite() || lastPrice <= 0.0) continue
+            val prevClose = row.optDouble("previousClose", Double.NaN).takeIf { it.isFinite() && it > 0.0 }
+            val rawPChg = row.optDouble("pChange", Double.NaN)
+            val chgPct = when {
+                rawPChg.isFinite() -> round(rawPChg * 100.0) / 100.0
+                prevClose != null -> round(((lastPrice - prevClose) / prevClose) * 10000.0) / 100.0
+                else -> 0.0
+            }
+            val dayHigh = row.optDouble("dayHigh", Double.NaN).takeIf { it.isFinite() && it > 0.0 }
+            val yearHigh = row.optDouble("yearHigh", Double.NaN).takeIf { it.isFinite() && it > 0.0 }
+            val yearLow = row.optDouble("yearLow", Double.NaN).takeIf { it.isFinite() && it > 0.0 }
+            quotes[sym] = LiveQuoteOverlay(
+                lastPrice = lastPrice,
+                dailyChangePct = chgPct,
+                barDate = sessionDate,
+                dayHigh = dayHigh,
+                yearHigh = yearHigh,
+                yearLow = yearLow
             )
-            for (i in 0 until dataArr.length()) {
-                val row = dataArr.optJSONObject(i) ?: continue
-                val idxName = row.optString("index", "").uppercase(Locale.US)
-                if (idxName == "INDIA VIX") {
-                    val last = row.optDouble("last", Double.NaN)
-                    if (!last.isNaN() && last > 0.0) {
-                        vixPair = sessionDt to (round(last * 100.0) / 100.0)
-                    }
-                } else {
-                    val u = indexToUniverse[idxName] ?: continue
-                    val adv = row.optDouble("advances", Double.NaN)
-                    val dec = row.optDouble("declines", Double.NaN)
-                    if (!adv.isNaN() && !dec.isNaN() && (adv + dec) > 0.0) {
-                        adMap[u] = round((adv / (adv + dec)) * 10000.0) / 100.0
-                    }
+        }
+        if (quotes.isEmpty()) return null
+        return LiveOverlayOutcome(
+            sourceLabel = "NSE Official Live",
+            sessionDate = sessionDate,
+            quotesBySymbol = quotes
+        )
+    }
+
+    private fun parseNseDateTimeToIsoDate(raw: String?): String? {
+        if (raw.isNullOrBlank()) return null
+        val cleaned = raw.trim().replace(Regex("\\s+"), " ")
+        for (fmt in NSE_TIMESTAMP_FORMATS) {
+            try {
+                val ld = LocalDate.parse(cleaned, fmt)
+                return ld.toString()
+            } catch (_: Exception) {
+            }
+        }
+        val firstToken = cleaned.substringBefore(' ')
+        for (fmt in NSE_TIMESTAMP_FORMATS) {
+            try {
+                return LocalDate.parse(firstToken, fmt).toString()
+            } catch (_: Exception) {
+            }
+        }
+        return null
+    }
+
+    private fun fetchNseIndicesMacro(): Pair<Pair<String, Double>?, Pair<String, Map<TankIndexUniverse, Double>>?>? {
+        val body = executeNseJsonGet(NSE_ALL_INDICES_URL) ?: return null
+        val root = JSONObject(body)
+        val dataArr = root.optJSONArray("data") ?: return null
+        val sessionDt = parseNseDateTimeToIsoDate(root.optString("timestamp", ""))
+            ?.takeIf { NseMarketCalendar.isValidTradingIsoDate(it) }
+            ?: NseMarketCalendar.latestMarketSessionDate(ZonedDateTime.now(IST_ZONE)).toString()
+        var vixPair: Pair<String, Double>? = null
+        val adMap = LinkedHashMap<TankIndexUniverse, Double>()
+        val indexToUniverse = mapOf(
+            "NIFTY 500" to TankIndexUniverse.NIFTY_500,
+            "NIFTY 50" to TankIndexUniverse.NIFTY_50,
+            "NIFTY NEXT 50" to TankIndexUniverse.NEXT_50,
+            "NIFTY MIDCAP 150" to TankIndexUniverse.MIDCAP_150,
+            "NIFTY SMALLCAP 250" to TankIndexUniverse.SMALLCAP_250
+        )
+        for (i in 0 until dataArr.length()) {
+            val row = dataArr.optJSONObject(i) ?: continue
+            val idxName = row.optString("index", "").uppercase(Locale.US)
+            if (idxName == "INDIA VIX") {
+                val last = row.optDouble("last", Double.NaN)
+                if (!last.isNaN() && last > 0.0) {
+                    vixPair = sessionDt to (round(last * 100.0) / 100.0)
+                }
+            } else {
+                val u = indexToUniverse[idxName] ?: continue
+                val adv = row.optDouble("advances", Double.NaN)
+                val dec = row.optDouble("declines", Double.NaN)
+                if (!adv.isNaN() && !dec.isNaN() && (adv + dec) > 0.0) {
+                    adMap[u] = round((adv / (adv + dec)) * 10000.0) / 100.0
                 }
             }
-            return vixPair to (if (adMap.isNotEmpty()) sessionDt to adMap else null)
         }
+        return vixPair to (if (adMap.isNotEmpty()) sessionDt to adMap else null)
     }
 
     private fun parseTickertapeIsoToDate(raw: String): String? {
@@ -744,6 +1172,12 @@ class LiveMarketTankDataSource(
     ): ScannerQueryOutcome {
         val root = JSONObject(jsonText)
         val dataArr = root.optJSONArray("data") ?: return ScannerQueryOutcome(emptyList(), null)
+        val sanitizedToCanonical = HashMap<String, String>(nifty500Symbols.size * 2)
+        for (sym in nifty500Symbols) {
+            val upper = sym.trim().uppercase(Locale.US)
+            sanitizedToCanonical[upper] = upper
+            sanitizedToCanonical[toTradingViewTickerSymbol(upper)] = upper
+        }
         val results = ArrayList<StockTank>(500)
         val seen = HashSet<String>(512)
         val dateCounts = HashMap<String, Int>()
@@ -759,12 +1193,9 @@ class LiveMarketTankDataSource(
 
             val rawSym = d.optString(0, "").trim().uppercase(Locale.US)
             if (rawSym.isEmpty()) continue
-            val normalizedSym = rawSym.replace("_", "-")
-            val matchedSym = when {
-                rawSym in nifty500Symbols -> rawSym
-                normalizedSym in nifty500Symbols -> normalizedSym
-                else -> continue
-            }
+            val matchedSym = sanitizedToCanonical[rawSym]
+                ?: sanitizedToCanonical[rawSym.replace("_", "-")]
+                ?: continue
             if (!seen.add(matchedSym)) continue
 
             val name = d.optString(1, matchedSym).ifBlank { matchedSym }
@@ -938,9 +1369,43 @@ class LiveMarketTankDataSource(
             val json = JSONObject(raw)
             val arr = json.optJSONArray("nifty500") ?: return emptyList()
             List(arr.length()) { idx -> arr.optString(idx).trim().uppercase(Locale.US) }
-                .filter { it.isNotEmpty() }
+                .filter { it.isNotEmpty() && !it.startsWith("DUMMY") && it != "HEGRAPHITE" }
         } catch (e: Exception) {
             Log.e(TAG, "Failed loading index_constituents.json", e)
+            emptyList()
+        }
+    }
+
+    private fun loadReferenceStocksFallback(): List<StockTank> {
+        return try {
+            val raw = context.assets.open("nifty500_stocks_seed.json").bufferedReader().use { it.readText() }
+            val arr = JSONArray(raw)
+            val list = ArrayList<StockTank>(arr.length())
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val symbol = obj.optString("symbol", "").trim().uppercase(Locale.US)
+                if (symbol.isEmpty()) continue
+                val price = obj.optDouble("price", 0.0)
+                val low52W = obj.optDouble("low52W", 0.0)
+                val high52W = obj.optDouble("high52W", 0.0)
+                if (price <= 0.0 || low52W <= 0.0 || high52W <= low52W) continue
+                list.add(
+                    StockTank(
+                        symbol = symbol,
+                        name = obj.optString("name", symbol),
+                        sector = obj.optString("sector", "Consumer & Tech"),
+                        currentPrice = price,
+                        low52W = low52W,
+                        high52W = high52W,
+                        dailyChangePct = obj.optDouble("chg", 0.0),
+                        todayHigh = obj.optDouble("todayHigh", price),
+                        rollingHistoryDays = obj.optInt("rollingHistoryDays", TankCalculator.FULL_52W_TRADING_DAYS)
+                    )
+                )
+            }
+            list
+        } catch (e: Exception) {
+            Log.w(TAG, "Reference stocks fallback unavailable: ${e.message}")
             emptyList()
         }
     }

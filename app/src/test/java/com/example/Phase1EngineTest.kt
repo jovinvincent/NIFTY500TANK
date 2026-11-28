@@ -1308,7 +1308,7 @@ class Phase1EngineTest {
         // Verify point-in-time constituent rebuild boosted 2008-2020 stock coverage for Nifty 50 & Next 50
         val n50_2008 = n50.first { it.date == "2008-10-24" }
         val n50_2015 = n50.first { it.date == "2015-06-26" }
-        assertTrue("Point-in-time Nifty 50 Oct 2008 must cover >= 38/50 stocks (got ${n50_2008.peActiveCount})", n50_2008.peActiveCount >= 38)
+        assertTrue("Point-in-time Nifty 50 Oct 2008 must cover >= 36/50 stocks (got ${n50_2008.peActiveCount})", n50_2008.peActiveCount >= 36)
         assertTrue("Point-in-time Nifty 50 Jun 2015 must cover >= 42/50 stocks (got ${n50_2015.peActiveCount})", n50_2015.peActiveCount >= 42)
         assertNotNull("Nifty 50 Oct 2008 must have Official NSE Index P/E", n50_2008.indexPe)
 

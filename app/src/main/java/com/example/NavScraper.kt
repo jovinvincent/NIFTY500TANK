@@ -15,13 +15,34 @@ import kotlin.math.round
 data class NavRecord(val dateStr: String, val nav: Double)
 
 object NavCache {
-    val cache = mutableMapOf<String, MutableList<NavRecord>>()
-    private val timeTreeMaps = mutableMapOf<String, java.util.TreeMap<Long, Double>>()
-    private val highestOptionCache = mutableMapOf<String, NavRecord>()
+    private const val MAX_CACHE_SIZE = 50
+    val cache = object : LinkedHashMap<String, MutableList<NavRecord>>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: Map.Entry<String, MutableList<NavRecord>>): Boolean {
+            val remove = size > MAX_CACHE_SIZE
+            if (remove) {
+                timeTreeMaps.remove(eldest.key)
+                highestOptionCache.remove(eldest.key)
+            }
+            return remove
+        }
+    }
+    private val timeTreeMaps = object : LinkedHashMap<String, java.util.TreeMap<Long, Double>>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: Map.Entry<String, java.util.TreeMap<Long, Double>>): Boolean {
+            return size > MAX_CACHE_SIZE
+        }
+    }
+    private val highestOptionCache = object : LinkedHashMap<String, NavRecord>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: Map.Entry<String, NavRecord>): Boolean {
+            return size > MAX_CACHE_SIZE
+        }
+    }
     private val parsedDateCache = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     fun parseDateToMillis(dateStr: String): Long {
         if (dateStr.isEmpty()) return 0L
+        if (parsedDateCache.size > 1000) {
+            parsedDateCache.clear()
+        }
         return parsedDateCache.getOrPut(dateStr) {
             val sdf1 = SimpleDateFormat("dd-MMM-yyyy", Locale.US)
             val sdf2 = SimpleDateFormat("yyyy-MM-dd", Locale.US)

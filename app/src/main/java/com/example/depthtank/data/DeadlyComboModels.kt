@@ -1060,7 +1060,7 @@ object DeadlyComboEngine {
         val officialIdxPb: Double? = latestOfficialPt?.indexPb?.let { roundTwo(it) }
         val officialIdxDy: Double? = latestOfficialPt?.indexDivYield?.let { roundTwo(it) }
         val useOfficialBenchmark = officialIdxPe != null
-        val isPitUniverse = universe == TankIndexUniverse.NIFTY_50 || universe == TankIndexUniverse.NEXT_50
+        val isPitUniverse = true
 
         // Primary Absolute P/E causal historical distribution:
         // Uses Official Point-in-Time NSE Index P/E when present (20Y window >= 2007-01-01 on modern dates, or full available pre-2016);
